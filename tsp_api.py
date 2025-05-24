@@ -1,65 +1,33 @@
 from flask import Flask, request, jsonify
-import numpy as np
-from sklearn.cluster import KMeans
-import requests
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+import os
+import requests
 
 app = Flask(__name__)
 
-ORS_API_KEY = "5b3ce3597851110001cf6248f3380fa418534bd499a9945c9361973e"
-ORS_MATRIX_URL = "https://api.openrouteservice.org/v2/matrix/driving-car"
+ORS_API_KEY = "ITT_ÍRD_BE_A_SAJÁT_ORS_API_KULCSODAT"
 
-def fetch_distance_matrix(locations):
-    """Lekéri az ORS távolságmátrixot közúton (méterben)."""
-    coords = [[lng, lat] for lat, lng in locations]  # ORS: [lon, lat]
-    data = {
-        "locations": coords,
-        "metrics": ["distance"],
-        "units": "m"
-    }
+def get_distance_matrix(locations):
+    """
+    Közúti távolságmátrix lekérése az ORS API-n keresztül.
+    locations: [(lat, lng), ...]
+    """
+    coords_str = "|".join([f"{lng},{lat}" for lat, lng in locations])  # ORS lng,lat sorrend!
+    url = f"https://api.openrouteservice.org/v2/matrix/driving-car"
     headers = {
         "Authorization": ORS_API_KEY,
         "Content-Type": "application/json"
     }
-    response = requests.post(ORS_MATRIX_URL, json=data, headers=headers)
-    response.raise_for_status()
-    matrix = response.json()["distances"]
-    return matrix
-
-def solve_tsp(distance_matrix):
-    """OR-Tools TSP megoldás (nem kell visszatérni a startpontra)."""
-    n = len(distance_matrix)
-    manager = pywrapcp.RoutingIndexManager(n, 1, 0)
-    routing = pywrapcp.RoutingModel(manager)
-
-    def distance_callback(from_index, to_index):
-        from_node = manager.IndexToNode(from_index)
-        to_node = manager.IndexToNode(to_index)
-        return int(distance_matrix[from_node][to_node])
-
-    transit_callback_index = routing.RegisterTransitCallback(distance_callback)
-    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
-
-    # Nem kötelező visszatérni a kiindulópontra
-    routing.AddConstraint(
-        routing.solver().MakeNoCycle(routing.NextVar(0))
-    )
-    # vagy alternatív megoldás: routing.SetDepot(-1), de ez nem mindig működik jól
-
-    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-    search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-
-    solution = routing.SolveWithParameters(search_parameters)
-    if solution:
-        route = []
-        index = routing.Start(0)
-        while not routing.IsEnd(index):
-            route.append(manager.IndexToNode(index))
-            index = solution.Value(routing.NextVar(index))
-        # Nem zárjuk a kört vissza a startpontra
-        return route
-    else:
-        return None
+    json_data = {
+        "locations": [[lng, lat] for lat, lng in locations],
+        "metrics": ["distance"],
+        "units": "m"
+    }
+    response = requests.post(url, json=json_data, headers=headers)
+    if response.status_code != 200:
+        raise Exception(f"ORS API hiba: {response.status_code} {response.text}")
+    data = response.json()
+    return data["distances"]
 
 @app.route("/optimize", methods=["POST"])
 def optimize():
@@ -73,41 +41,43 @@ def optimize():
     ]
 
     if len(coords) < 2:
-        return jsonify({"error": "Legalább 2 koordináta szükséges."}), 400
+        return jsonify({"error": "Legalább 2 érvényes koordináta szükséges."}), 400
 
-    # Klaszterezés (4 klaszter)
-    k = 4 if len(coords) >= 4 else 1
-    kmeans = KMeans(n_clusters=k, random_state=42).fit(coords)
-    labels = kmeans.labels_
+    try:
+        distance_matrix = get_distance_matrix(coords)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-    clusters = [[] for _ in range(k)]
-    for i, label in enumerate(labels):
-        clusters[label].append((i, coords[i]))  # index és koordináta
+    manager = pywrapcp.RoutingIndexManager(len(distance_matrix), 1, 0)  # 1 jármű, fix kezdőpont (0)
+    routing = pywrapcp.RoutingModel(manager)
 
-    final_route = []
-    cluster_centers = kmeans.cluster_centers_
+    def dist_callback(from_idx, to_idx):
+        return int(distance_matrix[manager.IndexToNode(from_idx)][manager.IndexToNode(to_idx)])
 
-    # Egyszerű klasztersorrend: klaszterközéppontok sorrendje (pl. északról délre)
-    sorted_clusters_order = np.argsort(cluster_centers[:, 0])  # lat szerint rendezve, módosítható
+    transit_index = routing.RegisterTransitCallback(dist_callback)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_index)
 
-    for ci in sorted_clusters_order:
-        cluster = clusters[ci]
-        if not cluster:
-            continue
+    # Nincs visszatérés a kezdőpontra:
+    routing.SetDepot(-1)
 
-        indices, cluster_coords = zip(*cluster)
+    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
+    search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
 
-        # Lekérjük a távolságmátrixot klaszteren belül
-        matrix = fetch_distance_matrix(cluster_coords)
-        route = solve_tsp(matrix)
-        if route is None:
-            return jsonify({"error": "Nem sikerült TSP megoldást találni."}), 500
+    solution = routing.SolveWithParameters(search_parameters)
 
-        # A klaszteren belüli pontok eredeti globális indexe
-        ordered_indices = [indices[i] for i in route]
-        final_route.extend(ordered_indices)
+    if not solution:
+        return jsonify({"error": "Nem található megoldás."}), 500
 
-    return jsonify({"route": final_route})
+    route = []
+    index = routing.Start(0)
+    while not routing.IsEnd(index):
+        route.append(manager.IndexToNode(index))
+        index = solution.Value(routing.NextVar(index))
+    route.append(manager.IndexToNode(index))  # Ez a végpont
+
+    return jsonify({"route": route})
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
