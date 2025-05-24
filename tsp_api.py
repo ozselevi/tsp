@@ -32,7 +32,7 @@ def get_distance_matrix(coords):
 
 def solve_tsp(distance_matrix):
     n = len(distance_matrix)
-    manager = pywrapcp.RoutingIndexManager(n, 1, None)  # nincs fix start/end
+    manager = pywrapcp.RoutingIndexManager(n, 1, 0)
     routing = pywrapcp.RoutingModel(manager)
 
     def dist_callback(from_index, to_index):
