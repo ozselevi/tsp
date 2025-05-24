@@ -100,6 +100,7 @@ def optimize_route():
     clusters = cluster_coords(coords, n_clusters)
 
     final_route = []
+    visited = set()
 
     try:
         for cluster in clusters:
@@ -111,7 +112,46 @@ def optimize_route():
                 return jsonify({"error": "Nem sikerült megoldani a TSP-t a klaszteren"}), 500
 
             ordered_indices = [indices[i] for i in route]
-            final_route.extend(ordered_indices)
+
+            for idx in ordered_indices:
+                if idx not in visited:
+                    final_route.append(idx)
+                    visited.add(idx)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"route": final_route})
+@app.route("/optimize", methods=["POST"])
+def optimize_route():
+    data = request.get_json()
+    raw_coords = data.get("locations")
+    if not raw_coords or len(raw_coords) < 2:
+        return jsonify({"error": "Legalább 2 koordináta szükséges"}), 400
+
+    coords = [(float(loc["lat"]), float(loc["lng"])) for loc in raw_coords]
+
+    # Klaszterezés
+    n_clusters = 4 if len(coords) >= 4 else 1
+    clusters = cluster_coords(coords, n_clusters)
+
+    final_route = []
+    visited = set()
+
+    try:
+        for cluster in clusters:
+            indices, cluster_coords_list = zip(*cluster)
+
+            dist_matrix = get_distance_matrix(cluster_coords_list)
+            route = solve_tsp(dist_matrix)
+            if route is None:
+                return jsonify({"error": "Nem sikerült megoldani a TSP-t a klaszteren"}), 500
+
+            ordered_indices = [indices[i] for i in route]
+
+            for idx in ordered_indices:
+                if idx not in visited:
+                    final_route.append(idx)
+                    visited.add(idx)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
