@@ -1,3 +1,4 @@
 flask
-googlemaps
 ortools
+requests
+scikit-learn
