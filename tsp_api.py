@@ -6,26 +6,38 @@ from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 app = Flask(__name__)
 
 ORS_API_KEY = "5b3ce3597851110001cf6248f3380fa418534bd499a9945c9361973e"
-ORS_MATRIX_URL = "https://api.openrouteservice.org/v2/matrix/driving-car"
 
 def get_distance_matrix(coords):
-    locations = [[lng, lat] for lat, lng in coords]  # ORS longitude-latitude sorrend
-    payload = {
-        "locations": locations,
-        "metrics": ["distance"],
-        "units": "m"
-    }
+    """
+    Lekéri az OpenRouteService távolságmátrixot közútra.
+    coords: [(lat, lng), ...]
+    Visszaadja: NxN mátrix méterben.
+    """
+    locations = [[lng, lat] for lat, lng in coords]  # ORS azonos formátum (lon, lat)
+    url = "https://api.openrouteservice.org/v2/matrix/driving-car"
+
     headers = {
         "Authorization": ORS_API_KEY,
         "Content-Type": "application/json"
     }
-    response = requests.post(ORS_MATRIX_URL, json=payload, headers=headers)
-    response.raise_for_status()
-    return response.json()["distances"]
+    data = {
+        "locations": locations,
+        "metrics": ["distance"],
+        "units": "m"
+    }
+
+    resp = requests.post(url, json=data, headers=headers)
+    if resp.status_code != 200:
+        raise Exception(f"ORS hiba: {resp.status_code} - {resp.text}")
+
+    matrix = resp.json()["distances"]
+    return matrix
 
 def solve_tsp(distance_matrix):
     n = len(distance_matrix)
-    manager = pywrapcp.RoutingIndexManager(n, 1, None)  # None = nincs fix kezdőpont
+    start = 0  # Fix kezdőpont
+
+    manager = pywrapcp.RoutingIndexManager(n, 1, start)
     routing = pywrapcp.RoutingModel(manager)
 
     def distance_callback(from_idx, to_idx):
@@ -36,39 +48,42 @@ def solve_tsp(distance_matrix):
     transit_callback_index = routing.RegisterTransitCallback(distance_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
+    # Nem kell visszatérni a kezdőpontra (open route)
+    routing.SetFixedCostOfAllVehicles(0)
+
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
     search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    # Ne kelljen visszatérni a kezdőpontra:
-    routing.SetFixedCostOfAllVehicles(0)
-    routing.SetDepot(-1)  # Depót nem definiálunk, szabad kezdés-végzés
 
     solution = routing.SolveWithParameters(search_parameters)
 
     if not solution:
         return None
 
-    # Megkeressük a legrövidebb útvonalat tetszőleges kezdő/végponttal:
-    # OR-Tools routing model alapból körutat ad, így ide trükközés kell,
-    # de itt egyszerűbb megoldás, hogy az első index-szel kezdjük:
     route = []
     index = routing.Start(0)
     while not routing.IsEnd(index):
         route.append(manager.IndexToNode(index))
         index = solution.Value(routing.NextVar(index))
-    # A végpont nincs hozzáadva az útvonalhoz, így:
     route.append(manager.IndexToNode(index))
 
-    # Ez körutat ad vissza, szabad kezdő/végpont nélkül:
-    # Ha tényleg nem akarunk körutat, OR-Tools-nál workaround kell, 
-    # de egyszerűbb ha elfogadjuk az eredményt és csak az első "körből" az elejét levágjuk.
-
-    return route[:-1]  # Utolsó elem a körút zárása, azt elhagyjuk.
+    return route
 
 def cluster_coords(coords, n_clusters=4):
+    """
+    Pontokat klaszterez KMeans-szel.
+    Visszaadja klaszterek listáját, ahol
+    egy klaszter [(eredeti_index, (lat,lng)), ...]
+    """
+    if len(coords) <= n_clusters:
+        return [[(i, coords[i])] for i in range(len(coords))]
+
     kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(coords)
+    labels = kmeans.labels_
+
     clusters = [[] for _ in range(n_clusters)]
-    for idx, label in enumerate(kmeans.labels_):
-        clusters[label].append((idx, coords[idx]))
+    for i, label in enumerate(labels):
+        clusters[label].append((i, coords[i]))
+
     return clusters
 
 @app.route("/optimize", methods=["POST"])
@@ -80,24 +95,25 @@ def optimize_route():
 
     coords = [(float(loc["lat"]), float(loc["lng"])) for loc in raw_coords]
 
-    # Darabolás klaszterekre
+    # Klaszterezés
     n_clusters = 4 if len(coords) >= 4 else 1
     clusters = cluster_coords(coords, n_clusters)
 
     final_route = []
-    offset = 0
 
-    for cluster in clusters:
-        indices, cluster_coords_list = zip(*cluster)
+    try:
+        for cluster in clusters:
+            indices, cluster_coords_list = zip(*cluster)
 
-        dist_matrix = get_distance_matrix(cluster_coords_list)
-        route = solve_tsp(dist_matrix)
-        if route is None:
-            return jsonify({"error": "Nem sikerült megoldani a TSP-t a klaszteren"}), 500
+            dist_matrix = get_distance_matrix(cluster_coords_list)
+            route = solve_tsp(dist_matrix)
+            if route is None:
+                return jsonify({"error": "Nem sikerült megoldani a TSP-t a klaszteren"}), 500
 
-        # Eredeti indexek visszaállítása
-        ordered_indices = [indices[i] for i in route]
-        final_route.extend(ordered_indices)
+            ordered_indices = [indices[i] for i in route]
+            final_route.extend(ordered_indices)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
     return jsonify({"route": final_route})
 
