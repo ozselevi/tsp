@@ -1,18 +1,16 @@
 from flask import Flask, request, jsonify
 import requests
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+from sklearn.cluster import KMeans
+import numpy as np
 
 app = Flask(__name__)
 
 ORS_API_KEY = "5b3ce3597851110001cf6248f3380fa418534bd499a9945c9361973e"
 
-def cluster_points(points, cluster_size=50):
-    # Egyszerű szétosztás csoportokra, pl. pontok sorrendjében
-    return [points[i:i + cluster_size] for i in range(0, len(points), cluster_size)]
-
 def get_distance_matrix(coords):
-    # coords = [(lat, lon), ...]
-    locations = [[lon, lat] for lat, lon in coords]  # ORS: [lon, lat]
+    # ORS-nek lon-lat kell
+    locations = [[lon, lat] for lat, lon in coords]
 
     url = "https://api.openrouteservice.org/v2/matrix/driving-car"
     headers = {
@@ -43,13 +41,13 @@ def solve_tsp(distance_matrix):
     transit_callback_index = routing.RegisterTransitCallback(dist_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
-    # Nem kötelező visszatérni a starthelyre:
+    # Nem kell visszatérni a kezdőpontra:
     routing.SetFixedCostOfVehicle(0, 0)
 
     search_params = pywrapcp.DefaultRoutingSearchParameters()
     search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     search_params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    search_params.time_limit.seconds = 10
+    search_params.time_limit.seconds = 30  # idő korlát növelhető
 
     solution = routing.SolveWithParameters(search_params)
     if not solution:
@@ -60,9 +58,18 @@ def solve_tsp(distance_matrix):
     while not routing.IsEnd(index):
         route.append(manager.IndexToNode(index))
         index = solution.Value(routing.NextVar(index))
-    # Nem kell visszatérni a starthelyre, így nem tesszük hozzá az utolsó pontot
-
     return route
+
+def cluster_points(points, n_clusters=4):
+    coords_np = np.array(points)
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42).fit(coords_np)
+    labels = kmeans.labels_
+    centers = kmeans.cluster_centers_
+
+    clusters = [[] for _ in range(n_clusters)]
+    for point, label in zip(points, labels):
+        clusters[label].append(point)
+    return clusters, centers
 
 @app.route("/optimize", methods=["POST"])
 def optimize_route():
@@ -71,25 +78,24 @@ def optimize_route():
     if len(points) < 2:
         return jsonify({"error": "Legalább 2 koordináta szükséges."}), 400
 
-    coords = [(float(p["lat"]), float(p["lng"])) for p in points]
+    # Tisztítsd a koordinátákat, konvertálj float-ra, üres értékeket hagyj ki
+    coords = []
+    for p in points:
+        try:
+            lat = float(p["lat"])
+            lng = float(p["lng"])
+            coords.append((lat, lng))
+        except (KeyError, ValueError, TypeError):
+            continue
 
-    # Daraboljuk kisebb csomagokra
-    clusters = cluster_points(coords, cluster_size=50)
+    if len(coords) < 2:
+        return jsonify({"error": "Legalább 2 érvényes koordináta szükséges."}), 400
 
-    full_route = []
-    offset = 0  # az összesített út indexeit kezeljük
+    # 1. Klaszterezés
+    n_clusters = 4 if len(coords) >= 4 else 1
+    clusters, centers = cluster_points(coords, n_clusters)
 
-    for cluster in clusters:
-        dist_matrix = get_distance_matrix(cluster)
-        route = solve_tsp(dist_matrix)
-        if not route:
-            return jsonify({"error": "Nem sikerült optimalizálni az egyik klasztert."}), 500
-        # a klaszteren belüli indexeket globális indexszé alakítjuk
-        global_route = [offset + i for i in route]
-        full_route.extend(global_route)
-        offset += len(cluster)
-
-    return jsonify({"route_order": full_route})
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    # 2. Klaszterközpontok sorrendjének optimalizálása (kicsi TSP)
+    # Egyszerű Euclid távolság a klaszterközpontok között:
+    def euclidean_dist(a, b):
+        return int(np.linalg.norm(np.array(a) - np.array(b)) * 1000)  # méterben
