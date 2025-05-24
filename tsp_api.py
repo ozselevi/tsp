@@ -5,7 +5,7 @@ import requests
 
 app = Flask(__name__)
 
-ORS_API_KEY = "ITT_ÍRD_BE_A_SAJÁT_ORS_API_KULCSODAT"
+ORS_API_KEY = "5b3ce3597851110001cf6248f3380fa418534bd499a9945c9361973e"
 
 def get_distance_matrix(locations):
     """
